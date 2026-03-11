@@ -1,0 +1,42 @@
+# Requirements for the Unified AI Video Cutter
+#
+# These are the core Python packages needed to run the AI video cutter.
+# For CUDA support ensure you install the appropriate CUDA version of
+# PyTorch/Torchaudio/Torchvision. For example, use cu121 wheels for
+# RTX 5080 GPUs.
+
+torch
+torchaudio
+torchvision
+
+# Speech recognition and alignment
+faster-whisper
+openai-whisper @ git+https://github.com/openai/whisper.git
+
+# Voice activity detection
+silero-vad
+webrtcvad-wheels
+
+# Natural language processing and text analysis
+transformers
+keybert
+natasha
+ruaccent
+
+# Audio and video processing
+librosa
+moviepy
+ffmpeg-python
+opencv-python
+
+# Optional extras
+pydub
+scikit-learn
+nltk
+scipy
+requests
+matplotlib
+seaborn
+
+# Packaging
+pyinstaller

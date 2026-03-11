@@ -1,0 +1,526 @@
+"""High level generator orchestrating the unified video cutting pipeline."""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Callable, List, Optional
+
+import ffmpeg
+from moviepy import VideoFileClip  # type: ignore
+from proglog import ProgressBarLogger
+
+from .core.constants import MAX_CLIP_DURATION, MIN_CLIP_DURATION, TARGET_SHORT_SIZE
+from .core.decorator_interface import DecoratorInterface
+from .core.frame_editor import EditorInterface
+from .decorators.subtitle_overlay import SubtitlesOverlay
+from .gpu import torch_cuda_available
+from .models import ProcessingRequest, SubtitleStyle
+from .segmentation import (
+    adjust_clip_boundaries,
+    adjust_segment_boundaries,
+    build_dynamic_subtitles,
+    detect_music_beats,
+    detect_speech_pauses,
+    generate_beats_segments,
+    group_segments,
+    iterative_candidate_selection,
+    transcribe_audio,
+    transcribe_precise_clip,
+    ENABLE_PRECISE_SUBTITLE_REFINEMENT,
+)
+
+logger = logging.getLogger(__name__)
+ProgressCallback = Callable[[float, str], None]
+
+
+class GuiProgressLogger(ProgressBarLogger):
+    """Translate MoviePy export progress into GUI progress updates."""
+
+    def __init__(
+        self,
+        callback: ProgressCallback,
+        clip_label: str,
+        stage_start: float,
+        stage_span: float,
+    ) -> None:
+        super().__init__(logged_bars=False, ignored_bars=None)
+        self._callback = callback
+        self._clip_label = clip_label
+        self._stage_start = stage_start
+        self._stage_span = stage_span
+
+    def _current_ratio(self) -> float:
+        audio_ratio = 0.0
+        video_ratio = 0.0
+
+        audio_bar = self.bars.get("chunk")
+        if audio_bar and audio_bar.get("total"):
+            audio_ratio = min(1.0, float(audio_bar["index"]) / float(audio_bar["total"]))
+
+        video_bar = self.bars.get("t")
+        if video_bar and video_bar.get("total"):
+            video_ratio = min(1.0, float(video_bar["index"]) / float(video_bar["total"]))
+
+        if video_bar and video_bar.get("total"):
+            return (audio_ratio * 0.2) + (video_ratio * 0.8)
+        if audio_bar and audio_bar.get("total"):
+            return audio_ratio
+        return 0.0
+
+    def bars_callback(self, bar, attr, value, old_value=None):
+        del old_value
+        if attr != "index":
+            return
+        ratio = self._current_ratio()
+        status = f"Encoding {self._clip_label}"
+        if bar == "chunk":
+            status = f"Encoding audio for {self._clip_label}"
+        elif bar == "t":
+            status = f"Encoding video for {self._clip_label}"
+        self._callback(self._stage_start + (self._stage_span * ratio), status)
+
+    def callback(self, **changes):
+        message = str(changes.get("message", "")).strip()
+        if not message:
+            return
+        lowered = message.lower()
+        if "writing audio" in lowered:
+            self._callback(self._stage_start, f"Encoding audio for {self._clip_label}")
+        elif "writing video" in lowered:
+            self._callback(self._stage_start + (self._stage_span * 0.2), f"Encoding video for {self._clip_label}")
+
+
+def extract_audio(video_path: str, audio_path: str = "temp_audio.wav") -> Optional[str]:
+    """Extract a mono WAV file from a video using ffmpeg."""
+    try:
+        ffmpeg.input(video_path).output(
+            audio_path, acodec="pcm_s16le", ac=1, ar=16000
+        ).run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+        return audio_path
+    except ffmpeg.Error as exc:
+        logger.error("Audio extraction error: %s", exc.stderr.decode())
+        return None
+
+
+def extract_audio_segment(
+    video_path: str,
+    start_time: float,
+    end_time: float,
+    audio_path: str,
+) -> Optional[str]:
+    try:
+        duration = max(0.01, end_time - start_time)
+        ffmpeg.input(video_path, ss=max(0.0, start_time), t=duration).output(
+            audio_path,
+            acodec="pcm_s16le",
+            ac=1,
+            ar=16000,
+        ).run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
+        return audio_path
+    except ffmpeg.Error as exc:
+        stderr = exc.stderr.decode() if getattr(exc, "stderr", None) else str(exc)
+        logger.error("Segment audio extraction error: %s", stderr)
+        return None
+
+
+class Candidate:
+    def __init__(
+        self,
+        start: float,
+        end: float,
+        text: str,
+        subtitles: Optional[List[dict[str, object]]] = None,
+    ) -> None:
+        self.start = start
+        self.end = end
+        self.text = text
+        self.subtitles = subtitles or []
+
+
+class ShortsGenerator:
+    def __init__(
+        self,
+        editor: EditorInterface,
+        decorators: Optional[List[DecoratorInterface]] = None,
+        target_size: tuple[int, int] = TARGET_SHORT_SIZE,
+        subtitle_style: SubtitleStyle | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> None:
+        self._editor = editor
+        self._decorators = decorators or []
+        self._target_size = target_size
+        self._subtitle_style = subtitle_style or SubtitleStyle()
+        self._progress_callback = progress_callback
+
+    def _report_progress(self, value: float, message: str) -> None:
+        if not self._progress_callback:
+            return
+        bounded_value = max(0.0, min(100.0, float(value)))
+        self._progress_callback(bounded_value, message)
+
+    @staticmethod
+    def _deduplicate_candidates(
+        candidates: List[Candidate],
+        pauses: List[tuple[float, float]],
+        video_duration: float,
+        mode: str,
+        min_duration: float,
+        max_duration: float,
+        max_clips: int,
+    ) -> List[Candidate]:
+        del pauses, video_duration, mode, min_duration, max_duration
+        unique: List[Candidate] = []
+        seen_ranges: set[tuple[int, int]] = set()
+        for candidate in sorted(candidates, key=lambda item: (item.start, item.end)):
+            start, end = candidate.start, candidate.end
+            key = (round(start * 10), round(end * 10))
+            if key in seen_ranges:
+                continue
+            overlaps_existing = any(
+                not (end <= existing.start or start >= existing.end)
+                for existing in unique
+            )
+            if overlaps_existing:
+                continue
+            seen_ranges.add(key)
+            unique.append(
+                Candidate(
+                    start=start,
+                    end=end,
+                    text=candidate.text,
+                    subtitles=candidate.subtitles,
+                )
+            )
+            if len(unique) >= max_clips:
+                break
+        return unique
+
+    @staticmethod
+    def _collect_overlapping_segments(
+        raw_segments: List[dict[str, float]],
+        start: float,
+        end: float,
+    ) -> List[dict[str, float]]:
+        overlapping: List[dict[str, float]] = []
+        for segment in raw_segments:
+            seg_start = float(segment["start"])
+            seg_end = float(segment["end"])
+            if seg_end <= start or seg_start >= end:
+                continue
+            overlapping.append(segment)
+        return overlapping
+
+    @classmethod
+    def _speech_coverage_ratio(
+        cls,
+        raw_segments: List[dict[str, float]],
+        start: float,
+        end: float,
+    ) -> float:
+        duration = max(0.01, end - start)
+        covered = 0.0
+        for segment in cls._collect_overlapping_segments(raw_segments, start, end):
+            covered += max(0.0, min(end, float(segment["end"])) - max(start, float(segment["start"])))
+        return covered / duration
+
+    async def _get_speech_candidates(
+        self,
+        audio_path: str,
+        video_duration: float,
+        min_clip_duration: float,
+        max_clip_duration: float,
+        clip_count: int,
+    ) -> List[Candidate]:
+        self._report_progress(15.0, "Transcribing speech")
+        transcript, raw_segments = await transcribe_audio(audio_path)
+        logger.info("Transcription returned %s raw segments", len(raw_segments))
+        if not raw_segments:
+            raise RuntimeError("Transcription produced no segments")
+        self._report_progress(28.0, "Detecting pauses")
+        pauses = detect_speech_pauses(audio_path)
+        logger.info("Pause detection returned %s intervals", len(pauses))
+        self._report_progress(36.0, "Grouping speech segments")
+        grouped_segments = group_segments(raw_segments, transcript)
+        logger.info("Grouped ASR into %s candidate segments", len(grouped_segments))
+        adjusted_segments = adjust_segment_boundaries(
+            grouped_segments,
+            pauses,
+            min_duration=min_clip_duration,
+            max_duration=max_clip_duration,
+        )
+        logger.info("Boundary adjustment produced %s segments", len(adjusted_segments))
+        candidate_pool_size = max(clip_count * 5, clip_count + 5)
+        candidates_dicts = iterative_candidate_selection(
+            adjusted_segments,
+            video_duration,
+            max_clips=candidate_pool_size,
+        )
+        logger.info("Interestingness selector picked %s candidates before dedup", len(candidates_dicts))
+        self._report_progress(44.0, "Building subtitles")
+        candidates: List[Candidate] = []
+        for item in candidates_dicts:
+            start, end = adjust_clip_boundaries(
+                float(item["start"]),
+                float(item["end"]),
+                pauses,
+                video_duration,
+                min_duration=min_clip_duration,
+                max_duration=max_clip_duration,
+            )
+            coverage_ratio = self._speech_coverage_ratio(raw_segments, start, end)
+            subtitles = build_dynamic_subtitles(raw_segments, start, end, pauses=pauses)
+            if not subtitles or coverage_ratio < 0.18:
+                logger.info(
+                    "Rejected candidate %.2f-%.2f due to low speech coverage: ratio=%.2f, subtitles=%s",
+                    start,
+                    end,
+                    coverage_ratio,
+                    len(subtitles),
+                )
+                continue
+            candidates.append(
+                Candidate(
+                    start=start,
+                    end=end,
+                    text=str(item["text"]),
+                    subtitles=subtitles,
+                )
+            )
+            logger.info(
+                "Accepted candidate %.2f-%.2f: coverage=%.2f, subtitles=%s",
+                start,
+                end,
+                coverage_ratio,
+                len(subtitles),
+            )
+        logger.info("Built %s speech candidates with dynamic subtitles", len(candidates))
+        return candidates
+
+    def _get_music_candidates(
+        self,
+        audio_path: str,
+        video_duration: float,
+        max_clips: int,
+        min_clip_duration: float,
+        max_clip_duration: float,
+    ) -> List[Candidate]:
+        self._report_progress(18.0, "Detecting beats")
+        beat_times = detect_music_beats(audio_path)
+        if not beat_times:
+            raise RuntimeError("Unable to detect beats in the audio")
+        self._report_progress(34.0, "Building beat segments")
+        segments = generate_beats_segments(
+            beat_times, video_duration, min_clip_duration, max_clip_duration
+        )
+        candidates = [
+            Candidate(start=item["start"], end=item["end"], text=item["text"])
+            for item in segments
+        ]
+        return candidates[:max_clips]
+
+    def _write_clip(
+        self,
+        clip,
+        output_path: str,
+        fps: int = 24,
+        stage_start: float = 55.0,
+        stage_span: float = 40.0,
+        clip_label: str = "clip",
+    ) -> None:
+        """Write a clip to disk using NVENC when CUDA is available."""
+        codec = "h264_nvenc" if torch_cuda_available() else "libx264"
+        export_logger: GuiProgressLogger | str | None = "bar"
+        if self._progress_callback:
+            export_logger = GuiProgressLogger(
+                callback=self._progress_callback,
+                clip_label=clip_label,
+                stage_start=stage_start,
+                stage_span=stage_span,
+            )
+        clip.write_videofile(
+            output_path,
+            codec=codec,
+            fps=fps,
+            threads=os.cpu_count() or 1,
+            logger=export_logger,
+        )
+
+    async def _refine_candidate_subtitles(
+        self,
+        request: ProcessingRequest,
+        candidate: Candidate,
+        candidate_index: int,
+    ) -> List[dict[str, object]]:
+        if request.mode != "speech" or not self._subtitle_style.enabled or not ENABLE_PRECISE_SUBTITLE_REFINEMENT:
+            return candidate.subtitles
+        temp_audio_path = os.path.join(request.output_dir, f"clip_{candidate_index}_subtitle_refine.wav")
+        segment_audio = extract_audio_segment(
+            request.input_path,
+            candidate.start,
+            candidate.end,
+            temp_audio_path,
+        )
+        if not segment_audio:
+            return candidate.subtitles
+        try:
+            _transcript, precise_segments = await transcribe_precise_clip(segment_audio)
+            if not precise_segments:
+                return candidate.subtitles
+            clip_pauses = detect_speech_pauses(segment_audio)
+            precise_subtitles = build_dynamic_subtitles(
+                precise_segments,
+                0.0,
+                candidate.end - candidate.start,
+                pauses=clip_pauses,
+            )
+            if precise_subtitles:
+                logger.info(
+                    "Refined subtitles for clip %s with %s timed entries",
+                    candidate_index,
+                    len(precise_subtitles),
+                )
+                return precise_subtitles
+            return candidate.subtitles
+        except Exception as exc:
+            logger.warning("Precise subtitle refinement failed for clip %s: %s", candidate_index, exc)
+            return candidate.subtitles
+        finally:
+            try:
+                os.remove(temp_audio_path)
+            except OSError:
+                pass
+
+    async def process(self, request: ProcessingRequest) -> List[str]:
+        self._report_progress(2.0, "Preparing output folder")
+        Path(request.output_dir).mkdir(parents=True, exist_ok=True)
+        self._report_progress(6.0, "Extracting audio")
+        audio_path = extract_audio(request.input_path)
+        if not audio_path:
+            raise RuntimeError("Failed to extract audio from the video")
+
+        self._report_progress(10.0, "Reading source video")
+        probe = ffmpeg.probe(request.input_path)
+        video_duration = float(probe["format"]["duration"])
+        pauses = detect_speech_pauses(audio_path) if request.mode == "speech" else []
+
+        if request.mode == "speech":
+            candidates = await self._get_speech_candidates(
+                audio_path,
+                video_duration,
+                request.min_clip_duration,
+                request.max_clip_duration,
+                request.clip_count,
+            )
+        elif request.mode == "beat":
+            candidates = self._get_music_candidates(
+                audio_path,
+                video_duration,
+                request.clip_count,
+                request.min_clip_duration,
+                request.max_clip_duration,
+            )
+        else:
+            raise ValueError("mode must be either 'speech' or 'beat'")
+
+        if not candidates:
+            raise RuntimeError("No candidates were generated")
+
+        output_paths: List[str] = []
+        self._report_progress(52.0, "Selecting clips")
+        candidates = self._deduplicate_candidates(
+            candidates,
+            pauses,
+            video_duration,
+            request.mode,
+            request.min_clip_duration,
+            request.max_clip_duration,
+            request.clip_count,
+        )
+        logger.info(
+            "Selected unique candidates: %s",
+            [(round(item.start, 2), round(item.end, 2)) for item in candidates],
+        )
+
+        for idx, candidate in enumerate(candidates):
+            total_candidates = max(1, len(candidates))
+            base_progress = 55.0 + ((idx / total_candidates) * 40.0)
+            clip_label = f"clip {idx + 1}/{total_candidates}"
+            self._report_progress(base_progress, f"Preparing {clip_label}")
+            start, end = candidate.start, candidate.end
+
+            with VideoFileClip(request.input_path) as video:
+                source_fragment = video.subclipped(start, end)
+                edited_clip = self._editor.get_short_video(source_fragment)
+                self._report_progress(base_progress + 4.0, f"Compositing {clip_label}")
+                refined_subtitles = await self._refine_candidate_subtitles(request, candidate, idx)
+                subtitle_decorator = SubtitlesOverlay(
+                    subtitles=refined_subtitles
+                    or [
+                        {
+                            "start": 0.0,
+                            "end": edited_clip.duration,
+                            "text": candidate.text,
+                        }
+                    ],
+                    style=self._subtitle_style,
+                    priority_index=150,
+                )
+
+                processed_clip = edited_clip
+                decorators = self._decorators + [subtitle_decorator]
+                for decorator in sorted(decorators, key=lambda item: item.get_priority_index()):
+                    try:
+                        processed_clip = decorator.get_processed_fragment(processed_clip)
+                    except Exception as exc:
+                        logger.warning(
+                            "Decorator %s failed on clip %s: %s",
+                            decorator.__class__.__name__,
+                            idx,
+                            exc,
+                        )
+
+                output_path = os.path.join(request.output_dir, f"clip_{idx}.mp4")
+                self._write_clip(
+                    processed_clip,
+                    output_path,
+                    stage_start=base_progress + 8.0,
+                    stage_span=max(1.0, (40.0 / total_candidates) - 1.0),
+                    clip_label=clip_label,
+                )
+                output_paths.append(output_path)
+                self._report_progress(
+                    55.0 + (((idx + 1) / total_candidates) * 40.0),
+                    f"Saved {clip_label}",
+                )
+
+                processed_clip.close()
+                edited_clip.close()
+                source_fragment.close()
+
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
+
+        self._report_progress(100.0, f"Done: {len(output_paths)} clips")
+        return output_paths
+
+    async def process_video(
+        self,
+        video_path: str,
+        output_dir: str,
+        mode: str = "speech",
+        max_clips: int = 10,
+    ) -> List[str]:
+        request = ProcessingRequest(
+            input_path=video_path,
+            output_dir=output_dir,
+            mode=mode,
+            clip_count=max_clips,
+            min_clip_duration=15.0,
+            max_clip_duration=20.0,
+            subtitle_style=self._subtitle_style,
+        )
+        return await self.process(request)
