@@ -2,20 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import logging
 import os
 from pathlib import Path
-from typing import Callable, List, Optional
+import threading
+from typing import Callable, List, Optional, Tuple
 
 import ffmpeg
 from moviepy import VideoFileClip  # type: ignore
-from proglog import ProgressBarLogger
+
+try:
+    from proglog import ProgressBarLogger
+except ModuleNotFoundError:  # pragma: no cover - fallback for lightweight test envs
+    class ProgressBarLogger:  # type: ignore[override]
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            self.bars = {}
 
 from .core.constants import MAX_CLIP_DURATION, MIN_CLIP_DURATION, TARGET_SHORT_SIZE
 from .core.decorator_interface import DecoratorInterface
 from .core.frame_editor import EditorInterface
 from .decorators.subtitle_overlay import SubtitlesOverlay
-from .gpu import torch_cuda_available
+from .gpu import ffmpeg_nvenc_available
 from .models import ProcessingRequest, SubtitleStyle
 from .segmentation import (
     adjust_clip_boundaries,
@@ -33,6 +44,14 @@ from .segmentation import (
 
 logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[float, str], None]
+
+
+@dataclass(frozen=True)
+class RenderJob:
+    candidate_index: int
+    candidate: "Candidate"
+    output_path: str
+    subtitles: List[dict[str, object]]
 
 
 class GuiProgressLogger(ProgressBarLogger):
@@ -139,6 +158,33 @@ class Candidate:
         self.subtitles = subtitles or []
 
 
+class ParallelProgressTracker:
+    """Aggregate progress from multiple clip render workers into one GUI stream."""
+
+    def __init__(
+        self,
+        callback: ProgressCallback | None,
+        total_jobs: int,
+        stage_start: float,
+        stage_span: float,
+    ) -> None:
+        self._callback = callback
+        self._stage_start = stage_start
+        self._stage_span = stage_span
+        self._lock = threading.Lock()
+        self._ratios = [0.0] * max(1, total_jobs)
+
+    def update(self, job_index: int, ratio: float, message: str) -> None:
+        if not self._callback:
+            return
+        bounded_ratio = max(0.0, min(1.0, float(ratio)))
+        with self._lock:
+            self._ratios[job_index] = bounded_ratio
+            average_ratio = sum(self._ratios) / len(self._ratios)
+        progress = self._stage_start + (self._stage_span * average_ratio)
+        self._callback(progress, message)
+
+
 class ShortsGenerator:
     def __init__(
         self,
@@ -154,11 +200,66 @@ class ShortsGenerator:
         self._subtitle_style = subtitle_style or SubtitleStyle()
         self._progress_callback = progress_callback
 
+    @staticmethod
+    def _build_export_settings() -> Tuple[str, List[str]]:
+        if ffmpeg_nvenc_available():
+            preset = os.environ.get("FINAL_PROJECT_NVENC_PRESET", "p6")
+            cq = os.environ.get("FINAL_PROJECT_NVENC_CQ", "19")
+            rc = os.environ.get("FINAL_PROJECT_NVENC_RC", "vbr")
+            return (
+                "h264_nvenc",
+                [
+                    "-preset",
+                    preset,
+                    "-rc",
+                    rc,
+                    "-cq",
+                    cq,
+                    "-b:v",
+                    "0",
+                    "-pix_fmt",
+                    "yuv420p",
+                ],
+            )
+        return ("libx264", ["-crf", os.environ.get("FINAL_PROJECT_X264_CRF", "18"), "-pix_fmt", "yuv420p"])
+
     def _report_progress(self, value: float, message: str) -> None:
         if not self._progress_callback:
             return
         bounded_value = max(0.0, min(100.0, float(value)))
         self._progress_callback(bounded_value, message)
+
+    @staticmethod
+    def _resolve_parallel_export_plan(
+        clip_count: int,
+        cpu_count: int | None = None,
+    ) -> tuple[int, int]:
+        safe_clip_count = max(1, int(clip_count))
+        total_cpus = max(1, int(cpu_count or os.cpu_count() or 1))
+        use_nvenc = ffmpeg_nvenc_available()
+        configured_workers = os.environ.get("FINAL_PROJECT_PARALLEL_EXPORTS", "").strip()
+        configured_threads = os.environ.get("FINAL_PROJECT_EXPORT_THREADS", "").strip()
+        if configured_workers:
+            try:
+                requested_workers = max(1, int(configured_workers))
+            except ValueError:
+                requested_workers = 1
+        else:
+            if use_nvenc:
+                requested_workers = min(6, max(2, total_cpus - 1))
+            else:
+                requested_workers = min(6, max(1, total_cpus // 2))
+        workers = max(1, min(safe_clip_count, requested_workers, total_cpus))
+        if configured_threads:
+            try:
+                threads_per_worker = max(1, int(configured_threads))
+            except ValueError:
+                threads_per_worker = 1
+        elif use_nvenc:
+            threads_per_worker = max(1, min(2, total_cpus // workers))
+        else:
+            threads_per_worker = max(1, total_cpus // workers)
+        return workers, threads_per_worker
 
     @staticmethod
     def _deduplicate_candidates(
@@ -325,16 +426,19 @@ class ShortsGenerator:
         clip,
         output_path: str,
         fps: int = 24,
+        threads: int | None = None,
+        progress_callback: ProgressCallback | None = None,
         stage_start: float = 55.0,
         stage_span: float = 40.0,
         clip_label: str = "clip",
     ) -> None:
-        """Write a clip to disk using NVENC when CUDA is available."""
-        codec = "h264_nvenc" if torch_cuda_available() else "libx264"
+        """Write a clip to disk, preferring NVENC when supported by FFmpeg."""
+        codec, ffmpeg_params = self._build_export_settings()
         export_logger: GuiProgressLogger | str | None = "bar"
-        if self._progress_callback:
+        effective_progress_callback = progress_callback or self._progress_callback
+        if effective_progress_callback:
             export_logger = GuiProgressLogger(
-                callback=self._progress_callback,
+                callback=effective_progress_callback,
                 clip_label=clip_label,
                 stage_start=stage_start,
                 stage_span=stage_span,
@@ -343,9 +447,118 @@ class ShortsGenerator:
             output_path,
             codec=codec,
             fps=fps,
-            threads=os.cpu_count() or 1,
+            threads=max(1, int(threads or os.cpu_count() or 1)),
+            ffmpeg_params=ffmpeg_params,
             logger=export_logger,
         )
+
+    def _render_job(
+        self,
+        request: ProcessingRequest,
+        job: RenderJob,
+        total_candidates: int,
+        export_threads: int,
+        progress_tracker: ParallelProgressTracker | None,
+    ) -> str:
+        clip_label = f"clip {job.candidate_index + 1}/{total_candidates}"
+        tracker = progress_tracker
+        if tracker:
+            tracker.update(job.candidate_index, 0.02, f"Opening {clip_label}")
+
+        with VideoFileClip(request.input_path) as video:
+            source_fragment = video.subclipped(job.candidate.start, job.candidate.end)
+            if tracker:
+                tracker.update(job.candidate_index, 0.12, f"Editing {clip_label}")
+            edited_clip = self._editor.get_short_video(source_fragment)
+            if tracker:
+                tracker.update(job.candidate_index, 0.24, f"Compositing {clip_label}")
+
+            subtitle_decorator = SubtitlesOverlay(
+                subtitles=job.subtitles
+                or [
+                    {
+                        "start": 0.0,
+                        "end": edited_clip.duration,
+                        "text": job.candidate.text,
+                    }
+                ],
+                style=self._subtitle_style,
+                priority_index=150,
+            )
+
+            processed_clip = edited_clip
+            decorators = self._decorators + [subtitle_decorator]
+            try:
+                for decorator in sorted(decorators, key=lambda item: item.get_priority_index()):
+                    try:
+                        processed_clip = decorator.get_processed_fragment(processed_clip)
+                    except Exception as exc:
+                        logger.warning(
+                            "Decorator %s failed on clip %s: %s",
+                            decorator.__class__.__name__,
+                            job.candidate_index,
+                            exc,
+                        )
+
+                if tracker:
+                    tracker.update(job.candidate_index, 0.3, f"Encoding {clip_label}")
+                self._write_clip(
+                    processed_clip,
+                    job.output_path,
+                    threads=export_threads,
+                    progress_callback=(
+                        (lambda value, message: tracker.update(job.candidate_index, value, message))
+                        if tracker
+                        else None
+                    ),
+                    stage_start=0.3,
+                    stage_span=0.68,
+                    clip_label=clip_label,
+                )
+                if tracker:
+                    tracker.update(job.candidate_index, 1.0, f"Saved {clip_label}")
+                return job.output_path
+            finally:
+                processed_clip.close()
+                edited_clip.close()
+                source_fragment.close()
+
+    async def _render_jobs_parallel(
+        self,
+        request: ProcessingRequest,
+        jobs: List[RenderJob],
+    ) -> List[str]:
+        if not jobs:
+            return []
+        worker_count, export_threads = self._resolve_parallel_export_plan(len(jobs))
+        logger.info(
+            "Parallel export plan: clips=%s workers=%s ffmpeg_threads_per_worker=%s",
+            len(jobs),
+            worker_count,
+            export_threads,
+        )
+        progress_tracker = ParallelProgressTracker(
+            callback=self._progress_callback,
+            total_jobs=len(jobs),
+            stage_start=65.0,
+            stage_span=33.0,
+        )
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="clip-render") as executor:
+            tasks = [
+                loop.run_in_executor(
+                    executor,
+                    self._render_job,
+                    request,
+                    job,
+                    len(jobs),
+                    export_threads,
+                    progress_tracker,
+                )
+                for job in jobs
+            ]
+            rendered_paths = await asyncio.gather(*tasks)
+        return list(rendered_paths)
 
     async def _refine_candidate_subtitles(
         self,
@@ -443,61 +656,25 @@ class ShortsGenerator:
             [(round(item.start, 2), round(item.end, 2)) for item in candidates],
         )
 
+        total_candidates = max(1, len(candidates))
+        render_jobs: List[RenderJob] = []
         for idx, candidate in enumerate(candidates):
-            total_candidates = max(1, len(candidates))
-            base_progress = 55.0 + ((idx / total_candidates) * 40.0)
+            prep_progress = 55.0 + (((idx + 1) / total_candidates) * 10.0)
             clip_label = f"clip {idx + 1}/{total_candidates}"
-            self._report_progress(base_progress, f"Preparing {clip_label}")
-            start, end = candidate.start, candidate.end
-
-            with VideoFileClip(request.input_path) as video:
-                source_fragment = video.subclipped(start, end)
-                edited_clip = self._editor.get_short_video(source_fragment)
-                self._report_progress(base_progress + 4.0, f"Compositing {clip_label}")
-                refined_subtitles = await self._refine_candidate_subtitles(request, candidate, idx)
-                subtitle_decorator = SubtitlesOverlay(
-                    subtitles=refined_subtitles
-                    or [
-                        {
-                            "start": 0.0,
-                            "end": edited_clip.duration,
-                            "text": candidate.text,
-                        }
-                    ],
-                    style=self._subtitle_style,
-                    priority_index=150,
+            self._report_progress(prep_progress - 4.0, f"Preparing {clip_label}")
+            refined_subtitles = await self._refine_candidate_subtitles(request, candidate, idx)
+            output_path = os.path.join(request.output_dir, f"clip_{idx}.mp4")
+            render_jobs.append(
+                RenderJob(
+                    candidate_index=idx,
+                    candidate=candidate,
+                    output_path=output_path,
+                    subtitles=refined_subtitles,
                 )
+            )
+            self._report_progress(prep_progress, f"Queued {clip_label}")
 
-                processed_clip = edited_clip
-                decorators = self._decorators + [subtitle_decorator]
-                for decorator in sorted(decorators, key=lambda item: item.get_priority_index()):
-                    try:
-                        processed_clip = decorator.get_processed_fragment(processed_clip)
-                    except Exception as exc:
-                        logger.warning(
-                            "Decorator %s failed on clip %s: %s",
-                            decorator.__class__.__name__,
-                            idx,
-                            exc,
-                        )
-
-                output_path = os.path.join(request.output_dir, f"clip_{idx}.mp4")
-                self._write_clip(
-                    processed_clip,
-                    output_path,
-                    stage_start=base_progress + 8.0,
-                    stage_span=max(1.0, (40.0 / total_candidates) - 1.0),
-                    clip_label=clip_label,
-                )
-                output_paths.append(output_path)
-                self._report_progress(
-                    55.0 + (((idx + 1) / total_candidates) * 40.0),
-                    f"Saved {clip_label}",
-                )
-
-                processed_clip.close()
-                edited_clip.close()
-                source_fragment.close()
+        output_paths = await self._render_jobs_parallel(request, render_jobs)
 
         try:
             os.remove(audio_path)

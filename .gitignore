@@ -26,6 +26,7 @@ dist/
 *.log
 
 # Local archives and temporary files
+.env
 *.zip
 *.rar
 *.7z

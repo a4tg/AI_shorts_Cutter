@@ -86,10 +86,16 @@ ffmpeg_stub.probe = lambda *args, **kwargs: {"format": {"duration": 0}}
 sys.modules.setdefault("ffmpeg", ffmpeg_stub)
 
 from final_project.core.frame_editor import EditorStandard
+from final_project import generator as generator_module
 from final_project.generator import Candidate, ShortsGenerator
 from final_project.gpu import RuntimeDiagnostics, format_runtime_summary, torch_cuda_available
-from final_project.gui import build_request_from_form_values, filter_font_labels
-from final_project.main import build_processing_request, parse_args
+from final_project.gui import (
+    build_request_from_form_values,
+    build_requests_from_form_values,
+    build_requests_from_queue_items,
+    filter_font_labels,
+)
+from final_project.main import build_processing_request, build_processing_requests, parse_args
 from final_project.models import SubtitleStyle
 from final_project.decorators.sticker_overlay import StickerOverlay
 from final_project.decorators.subtitle_overlay import SubtitlesOverlay
@@ -139,6 +145,7 @@ def test_count_argument_overrides_max_clips(monkeypatch):
     )
     args = parse_args()
     assert args.max_clips == 3
+    assert args.input == ["in.mp4"]
 
 
 def test_build_processing_request_maps_subtitle_settings(monkeypatch):
@@ -168,6 +175,49 @@ def test_build_processing_request_maps_subtitle_settings(monkeypatch):
         background_enabled=True,
     )
     assert request.subtitle_style.font == ""
+
+
+def test_build_processing_requests_create_named_output_subfolders(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            "--input",
+            "C:/videos/alpha.mp4",
+            "C:/videos/alpha.mov",
+            "--output",
+            "C:/clips",
+        ],
+    )
+    args = parse_args()
+
+    requests = build_processing_requests(args)
+
+    assert [Path(item.output_dir) for item in requests] == [Path("C:/clips/alpha"), Path("C:/clips/alpha_2")]
+
+
+def test_build_processing_requests_apply_individual_clip_counts(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            "--input",
+            "C:/videos/alpha.mp4",
+            "C:/videos/beta.mov",
+            "--output",
+            "C:/clips",
+            "--clip-counts",
+            "3",
+            "7",
+        ],
+    )
+    args = parse_args()
+
+    requests = build_processing_requests(args)
+
+    assert [item.clip_count for item in requests] == [3, 7]
 
 
 def test_editor_standard_builds_blurred_background_and_scaled_foreground():
@@ -206,12 +256,48 @@ def test_gui_form_values_build_request():
     assert request.max_clip_duration == 22
     assert request.mode == "beat"
     assert request.sticker_path == "sticker.gif"
-    assert request.sticker_position == "top_right"
+    assert request.sticker_position == "below_subtitles_center"
     assert request.sound_path == "music.mp3"
     assert request.subtitle_style.enabled is False
     assert request.subtitle_style.background_enabled is True
     assert request.subtitle_style.font == "C:/Windows/Fonts/arial.ttf"
     assert request.subtitle_style.auto_fit is False
+
+
+def test_gui_form_values_build_batch_requests_into_named_subfolders():
+    requests = build_requests_from_form_values(
+        input_path="C:/videos/alpha.mp4; C:/videos/beta.mp4",
+        output_dir="C:/output",
+        clip_count="7",
+    )
+
+    assert [item.input_path for item in requests] == ["C:/videos/alpha.mp4", "C:/videos/beta.mp4"]
+    assert [Path(item.output_dir) for item in requests] == [Path("C:/output/alpha"), Path("C:/output/beta")]
+
+
+def test_gui_form_values_build_batch_requests_apply_individual_clip_counts():
+    requests = build_requests_from_form_values(
+        input_path="C:/videos/alpha.mp4; C:/videos/beta.mp4",
+        output_dir="C:/output",
+        clip_count="5",
+        per_video_clip_counts="2; 9",
+    )
+
+    assert [item.clip_count for item in requests] == [2, 9]
+
+
+def test_gui_queue_items_build_requests_apply_individual_clip_counts():
+    requests = build_requests_from_queue_items(
+        queue_items=[
+            ("C:/videos/alpha.mp4", 4),
+            ("C:/videos/beta.mp4", 6),
+        ],
+        output_dir="C:/output",
+    )
+
+    assert [item.input_path for item in requests] == ["C:/videos/alpha.mp4", "C:/videos/beta.mp4"]
+    assert [item.clip_count for item in requests] == [4, 6]
+    assert [Path(item.output_dir) for item in requests] == [Path("C:/output/alpha"), Path("C:/output/beta")]
 
 
 def test_gui_form_values_reject_invalid_clip_count():
@@ -376,6 +462,43 @@ def test_sticker_overlay_bottom_right_position_uses_full_sticker_size():
     assert position == (712, 1572)
 
 
+def test_sticker_overlay_below_subtitles_center_position():
+    position = StickerOverlay._parse_position("below_subtitles_center", (1080, 1920), (320, 300))
+    assert position == ("center", 1860)
+
+
+def test_sticker_overlay_below_subtitles_center_fits_to_video_width():
+    clip = DummyClip((320, 240))
+    overlay = StickerOverlay(position="below_subtitles_center")
+
+    result = overlay._fit_to_quadrant(clip, (1080, 1920))
+
+    assert result is clip
+    assert clip.resize_calls == [1080 / 320]
+
+
+def test_sticker_overlay_crop_white_margins_detects_content_bbox():
+    class WhiteBorderClip:
+        def __init__(self):
+            self.cropped_args = None
+
+        def get_frame(self, _t):
+            frame = np.full((6, 8, 3), 255, dtype=np.uint8)
+            frame[2:5, 3:7] = 0
+            return frame
+
+        def cropped(self, **kwargs):
+            self.cropped_args = kwargs
+            return self
+
+    clip = WhiteBorderClip()
+
+    result = StickerOverlay._crop_white_margins(clip, white_threshold=245)
+
+    assert result is clip
+    assert clip.cropped_args == {"x1": 3, "y1": 2, "x2": 7, "y2": 5}
+
+
 def test_subtitles_overlay_renders_with_float_style_values():
     style = SubtitleStyle(
         fontsize=42,
@@ -495,6 +618,88 @@ def test_fit_sticker_duration_trims_to_target_duration():
     result = StickerOverlay._fit_sticker_duration(clip, 20.0)
 
     assert result is clip
+
+
+def test_build_export_settings_uses_nvenc_when_available(monkeypatch):
+    monkeypatch.setattr(generator_module, "ffmpeg_nvenc_available", lambda: True)
+    monkeypatch.setenv("FINAL_PROJECT_NVENC_PRESET", "p7")
+    monkeypatch.setenv("FINAL_PROJECT_NVENC_CQ", "18")
+    monkeypatch.setenv("FINAL_PROJECT_NVENC_RC", "vbr")
+
+    codec, ffmpeg_params = ShortsGenerator._build_export_settings()
+
+    assert codec == "h264_nvenc"
+    assert ffmpeg_params == [
+        "-preset",
+        "p7",
+        "-rc",
+        "vbr",
+        "-cq",
+        "18",
+        "-b:v",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+
+
+def test_build_export_settings_falls_back_to_x264(monkeypatch):
+    monkeypatch.setattr(generator_module, "ffmpeg_nvenc_available", lambda: False)
+    monkeypatch.setenv("FINAL_PROJECT_X264_CRF", "17")
+
+    codec, ffmpeg_params = ShortsGenerator._build_export_settings()
+
+    assert codec == "libx264"
+    assert ffmpeg_params == ["-crf", "17", "-pix_fmt", "yuv420p"]
+
+
+def test_resolve_parallel_export_plan_uses_safe_defaults(monkeypatch):
+    monkeypatch.delenv("FINAL_PROJECT_PARALLEL_EXPORTS", raising=False)
+    monkeypatch.delenv("FINAL_PROJECT_EXPORT_THREADS", raising=False)
+    monkeypatch.setattr(generator_module, "ffmpeg_nvenc_available", lambda: False)
+
+    workers, threads = ShortsGenerator._resolve_parallel_export_plan(clip_count=5, cpu_count=8)
+
+    assert workers == 4
+    assert threads == 2
+
+
+def test_resolve_parallel_export_plan_honors_env_override(monkeypatch):
+    monkeypatch.setenv("FINAL_PROJECT_PARALLEL_EXPORTS", "3")
+    monkeypatch.delenv("FINAL_PROJECT_EXPORT_THREADS", raising=False)
+    monkeypatch.setattr(generator_module, "ffmpeg_nvenc_available", lambda: False)
+
+    workers, threads = ShortsGenerator._resolve_parallel_export_plan(clip_count=2, cpu_count=12)
+
+    assert workers == 2
+    assert threads == 6
+
+
+def test_resolve_parallel_export_plan_prefers_more_workers_with_nvenc(monkeypatch):
+    monkeypatch.delenv("FINAL_PROJECT_PARALLEL_EXPORTS", raising=False)
+    monkeypatch.delenv("FINAL_PROJECT_EXPORT_THREADS", raising=False)
+    monkeypatch.setattr(generator_module, "ffmpeg_nvenc_available", lambda: True)
+
+    workers, threads = ShortsGenerator._resolve_parallel_export_plan(clip_count=5, cpu_count=8)
+
+    assert workers == 5
+    assert threads == 1
+
+
+def test_parallel_progress_tracker_reports_average_progress():
+    updates = []
+    tracker = generator_module.ParallelProgressTracker(
+        callback=lambda value, message: updates.append((value, message)),
+        total_jobs=2,
+        stage_start=65.0,
+        stage_span=33.0,
+    )
+
+    tracker.update(0, 0.5, "Encoding clip 1/2")
+    tracker.update(1, 1.0, "Saved clip 2/2")
+
+    assert updates[0] == (73.25, "Encoding clip 1/2")
+    assert updates[1] == (89.75, "Saved clip 2/2")
 
 
 def test_adjust_clip_boundaries_prefers_pause_aligned_end():

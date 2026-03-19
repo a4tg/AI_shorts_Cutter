@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "final-project-video-cutter"
+version = "0.1.0"
+description = "Desktop and CLI utility for generating short vertical videos."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "torchaudio",
+    "torchvision",
+    "faster-whisper",
+    "openai-whisper @ git+https://github.com/openai/whisper.git",
+    "silero-vad",
+    "webrtcvad-wheels",
+    "transformers",
+    "keybert",
+    "natasha",
+    "ruaccent",
+    "librosa",
+    "moviepy",
+    "ffmpeg-python",
+    "opencv-python",
+    "proglog",
+    "pydub",
+    "scikit-learn",
+    "nltk",
+    "scipy",
+    "requests",
+    "matplotlib",
+    "seaborn",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+build = [
+    "pyinstaller",
+]
+
+[project.scripts]
+final-project-cli = "final_project.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -20,6 +20,8 @@ Run ``python -m final_project.main --help`` to see all available options.
 import argparse
 import asyncio
 import logging
+import re
+from pathlib import Path
 from typing import Callable, List, Optional
 
 from .core.frame_editor import EditorStandard, FrameEditor
@@ -34,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AI powered video cutter and resizer")
-    parser.add_argument("--input", "-i", required=True, help="Path to the input video file")
+    parser.add_argument("--input", "-i", required=True, nargs="+", help="One or more input video files")
     parser.add_argument("--output", "-o", required=True, help="Directory to store the output clips")
     parser.add_argument(
         "--mode",
@@ -95,6 +97,12 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of clips to generate",
     )
     parser.add_argument(
+        "--clip-counts",
+        nargs="*",
+        type=int,
+        help="Optional per-input clip counts. Provide one value to reuse for all inputs or one value per input.",
+    )
+    parser.add_argument(
         "--min-duration",
         type=float,
         default=15.0,
@@ -127,31 +135,80 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_processing_request(args: argparse.Namespace) -> ProcessingRequest:
+def _sanitize_output_folder_name(file_path: str) -> str:
+    raw_name = Path(file_path).stem.strip() or "video"
+    sanitized = re.sub(r'[<>:"/\\\\|?*]+', "_", raw_name).rstrip(" .")
+    return sanitized or "video"
+
+
+def _build_output_directories(input_paths: List[str], output_root: str) -> List[str]:
+    if len(input_paths) == 1:
+        return [output_root]
+    used_names: dict[str, int] = {}
+    output_dirs: List[str] = []
+    for input_path in input_paths:
+        base_name = _sanitize_output_folder_name(input_path)
+        occurrence = used_names.get(base_name, 0) + 1
+        used_names[base_name] = occurrence
+        folder_name = base_name if occurrence == 1 else f"{base_name}_{occurrence}"
+        output_dirs.append(str(Path(output_root) / folder_name))
+    return output_dirs
+
+
+def _resolve_clip_counts(
+    input_paths: List[str],
+    default_clip_count: int,
+    configured_counts: Optional[List[int]],
+) -> List[int]:
+    if not configured_counts:
+        return [default_clip_count] * len(input_paths)
+    positive_counts = [int(item) for item in configured_counts]
+    if any(item <= 0 for item in positive_counts):
+        raise ValueError("Clip counts must be greater than zero")
+    if len(positive_counts) == 1:
+        return positive_counts * len(input_paths)
+    if len(positive_counts) != len(input_paths):
+        raise ValueError("Clip counts must contain either one value or one value per input video")
+    return positive_counts
+
+
+def build_processing_requests(args: argparse.Namespace) -> List[ProcessingRequest]:
     if args.min_duration <= 0 or args.max_duration <= 0:
         raise ValueError("Clip durations must be greater than zero")
     if args.min_duration > args.max_duration:
         raise ValueError("Minimum duration must be less than or equal to maximum duration")
+    input_paths = [str(Path(item)) for item in args.input]
+    output_dirs = _build_output_directories(input_paths, args.output)
+    clip_counts = _resolve_clip_counts(input_paths, args.max_clips, args.clip_counts)
     subtitle_style = SubtitleStyle(
         enabled=args.subtitles,
         fontsize=args.subtitle_fontsize,
         background_enabled=args.subtitle_background,
     )
-    return ProcessingRequest(
-        input_path=args.input,
-        output_dir=args.output,
-        mode=args.mode,
-        clip_count=args.max_clips,
-        min_clip_duration=args.min_duration,
-        max_clip_duration=args.max_duration,
-        coords=tuple(args.coords) if args.coords else None,
-        blur_radius=args.blur_radius,
-        sticker_path=args.sticker,
-        sticker_size=tuple(args.sticker_size) if args.sticker_size else None,
-        sticker_position=args.sticker_position,
-        sound_path=args.sound,
-        subtitle_style=subtitle_style,
-    )
+    requests: List[ProcessingRequest] = []
+    for input_path, output_dir, clip_count in zip(input_paths, output_dirs, clip_counts):
+        requests.append(
+            ProcessingRequest(
+                input_path=input_path,
+                output_dir=output_dir,
+                mode=args.mode,
+                clip_count=clip_count,
+                min_clip_duration=args.min_duration,
+                max_clip_duration=args.max_duration,
+                coords=tuple(args.coords) if args.coords else None,
+                blur_radius=args.blur_radius,
+                sticker_path=args.sticker,
+                sticker_size=tuple(args.sticker_size) if args.sticker_size else None,
+                sticker_position=args.sticker_position,
+                sound_path=args.sound,
+                subtitle_style=subtitle_style,
+            )
+        )
+    return requests
+
+
+def build_processing_request(args: argparse.Namespace) -> ProcessingRequest:
+    return build_processing_requests(args)[0]
 
 
 def build_generator(
@@ -186,10 +243,12 @@ def build_generator(
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    request = build_processing_request(args)
-    generator = build_generator(request)
-    output_paths = await generator.process(request)
-    logging.info(f"Generated {len(output_paths)} clips: {output_paths}")
+    requests = build_processing_requests(args)
+    for index, request in enumerate(requests, start=1):
+        logging.info("Processing video %s/%s: %s", index, len(requests), request.input_path)
+        generator = build_generator(request)
+        output_paths = await generator.process(request)
+        logging.info("Generated %s clips for %s: %s", len(output_paths), request.input_path, output_paths)
 
 
 def main() -> None:

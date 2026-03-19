@@ -10,6 +10,7 @@ target clip it will be looped automatically.
 from pathlib import Path
 import math
 from typing import Optional, Tuple, Union
+import numpy as np
 
 from moviepy import VideoFileClip, VideoClip, ImageClip, CompositeVideoClip, vfx  # type: ignore
 
@@ -47,6 +48,7 @@ class StickerOverlay(DecoratorInterface):
             "center": ("center", "center"),
             "top": ("center", 50),
             "bottom": ("center", video_size[1] - sticker_height - margin),
+            "below_subtitles_center": ("center", max(0, video_size[1] - sticker_height + int(video_size[1] * 0.125))),
             "left": (50, "center"),
             "right": (video_size[0] - sticker_width - margin, "center"),
             "top_left": (50, 50),
@@ -55,6 +57,32 @@ class StickerOverlay(DecoratorInterface):
             "bottom_right": (video_size[0] - sticker_width - margin, video_size[1] - sticker_height - margin),
         }
         return positions.get(position_str, ("center", "center"))
+
+    @staticmethod
+    def _crop_white_margins(
+        clip: Union[VideoClip, ImageClip],
+        white_threshold: int = 245,
+    ) -> Union[VideoClip, ImageClip]:
+        if not hasattr(clip, "get_frame") or not hasattr(clip, "cropped"):
+            return clip
+        try:
+            frame = clip.get_frame(0)
+        except Exception:
+            return clip
+        if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 3 or frame.shape[2] < 3:
+            return clip
+        rgb = np.array(frame[..., :3], dtype=np.uint8)
+        non_white_mask = np.any(rgb < white_threshold, axis=2)
+        if not np.any(non_white_mask):
+            return clip
+        ys, xs = np.where(non_white_mask)
+        x1 = int(xs.min())
+        x2 = int(xs.max()) + 1
+        y1 = int(ys.min())
+        y2 = int(ys.max()) + 1
+        if x1 <= 0 and y1 <= 0 and x2 >= frame.shape[1] and y2 >= frame.shape[0]:
+            return clip
+        return clip.cropped(x1=x1, y1=y1, x2=x2, y2=y2)
 
     @staticmethod
     def _load_sticker(file_path: str) -> Optional[Union[VideoClip, ImageClip]]:
@@ -85,6 +113,11 @@ class StickerOverlay(DecoratorInterface):
     ) -> Union[VideoClip, ImageClip]:
         if self._size:
             return self._resize_sticker(clip)
+        if self._position_str == "below_subtitles_center":
+            clip_width, _clip_height = clip.size
+            if clip_width <= 0:
+                return clip
+            return clip.resized(video_size[0] / clip_width)
         if self._position_str not in {"bottom_right", "top_right"}:
             return clip
         max_width = int(video_size[0] * 0.42)
@@ -127,6 +160,7 @@ class StickerOverlay(DecoratorInterface):
             return edited_fragment
         video_size = edited_fragment.size
         sticker_clip = self._fit_to_quadrant(sticker_clip, video_size)
+        sticker_clip = self._crop_white_margins(sticker_clip)
         sticker_clip = self._apply_effects(sticker_clip)
         sticker_clip = self._fit_sticker_duration(sticker_clip, edited_fragment.duration)
         position = self._parse_position(self._position_str, video_size, sticker_clip.size)

@@ -28,6 +28,7 @@ librosa
 moviepy
 ffmpeg-python
 opencv-python
+proglog
 
 # Optional extras
 pydub
@@ -37,6 +38,3 @@ scipy
 requests
 matplotlib
 seaborn
-
-# Packaging
-pyinstaller

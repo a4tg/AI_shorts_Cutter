@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import shutil
 import subprocess
+from functools import lru_cache
 from typing import List
 
 
@@ -35,6 +36,16 @@ def _run_command(command: List[str], timeout: int = 10) -> tuple[bool, str]:
         return False, ""
     output = (completed.stdout or "") + "\n" + (completed.stderr or "")
     return completed.returncode == 0, output.strip()
+
+
+@lru_cache(maxsize=1)
+def ffmpeg_nvenc_available() -> bool:
+    if shutil.which("ffmpeg") is None:
+        return False
+    ok, output = _run_command(["ffmpeg", "-encoders"])
+    if not ok and not output:
+        return False
+    return "h264_nvenc" in output or "hevc_nvenc" in output
 
 
 def torch_cuda_available() -> bool:
@@ -77,18 +88,14 @@ def probe_runtime_diagnostics() -> RuntimeDiagnostics:
             gpu_name = output.splitlines()[0].strip()
 
     ffmpeg_available = shutil.which("ffmpeg") is not None
-    ffmpeg_nvenc_available = False
-    if ffmpeg_available:
-        ok, output = _run_command(["ffmpeg", "-encoders"])
-        if ok or output:
-            ffmpeg_nvenc_available = "h264_nvenc" in output or "hevc_nvenc" in output
+    ffmpeg_nvenc_is_available = ffmpeg_nvenc_available() if ffmpeg_available else False
 
     recommendations: List[str] = []
-    execution_device = "cuda" if torch_cuda and ffmpeg_nvenc_available else "cpu"
+    execution_device = "cuda" if torch_cuda and ffmpeg_nvenc_is_available else "cpu"
 
     if not ffmpeg_available:
         recommendations.append("Install FFmpeg and add it to PATH.")
-    elif nvidia_smi_available and not ffmpeg_nvenc_available:
+    elif nvidia_smi_available and not ffmpeg_nvenc_is_available:
         recommendations.append("FFmpeg is installed but NVENC is unavailable. Install an FFmpeg build with NVENC support.")
 
     if nvidia_smi_available and not torch_cuda:
@@ -106,7 +113,7 @@ def probe_runtime_diagnostics() -> RuntimeDiagnostics:
         gpu_name=gpu_name,
         nvidia_smi_available=nvidia_smi_available,
         ffmpeg_available=ffmpeg_available,
-        ffmpeg_nvenc_available=ffmpeg_nvenc_available,
+        ffmpeg_nvenc_available=ffmpeg_nvenc_is_available,
         execution_device=execution_device,
         recommendations=recommendations,
     )
