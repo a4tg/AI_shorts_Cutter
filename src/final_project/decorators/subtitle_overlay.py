@@ -1,6 +1,7 @@
 """Decorator to overlay subtitles onto a video fragment."""
 
 from pathlib import Path
+from functools import lru_cache
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
@@ -22,8 +23,10 @@ class SubtitlesOverlay(DecoratorInterface):
         super().__init__(priority_index)
         self._subtitles = subtitles
         self._style = style or SubtitleStyle()
+        self._font_cache: Dict[int, ImageFont.FreeTypeFont | ImageFont.ImageFont] = {}
 
     @staticmethod
+    @lru_cache(maxsize=1)
     def _find_system_font() -> str:
         candidates = [
             Path("C:/Windows/Fonts/arial.ttf"),
@@ -39,12 +42,19 @@ class SubtitlesOverlay(DecoratorInterface):
     def _resolve_font(self, font_size: int | None = None) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         font_path = self._style.font or self._find_system_font()
         resolved_size = max(1, int(font_size if font_size is not None else self._style.fontsize))
+        cached_font = self._font_cache.get(resolved_size)
+        if cached_font is not None:
+            return cached_font
         if font_path:
             try:
-                return ImageFont.truetype(font_path, resolved_size)
+                font = ImageFont.truetype(font_path, resolved_size)
+                self._font_cache[resolved_size] = font
+                return font
             except Exception:
                 pass
-        return ImageFont.load_default()
+        font = ImageFont.load_default()
+        self._font_cache[resolved_size] = font
+        return font
 
     def _resolve_position(
         self,

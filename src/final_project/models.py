@@ -39,6 +39,8 @@ class ProcessingRequest:
     coords: Optional[Tuple[int, int, int, int]] = None
     blur_radius: float = 0.0
     sticker_path: Optional[str] = None
+    sticker_paths: Tuple[str, ...] = ()
+    sticker_clips_count: Optional[int] = None
     sticker_size: Optional[Tuple[int, int]] = None
     sticker_position: str = "bottom"
     sound_path: Optional[str] = None

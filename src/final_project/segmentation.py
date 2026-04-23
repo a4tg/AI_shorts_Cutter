@@ -16,7 +16,8 @@ from .gpu import torch_cuda_available
 logger = logging.getLogger(__name__)
 
 DEFAULT_ASR_MODEL_NAME = os.environ.get("FINAL_PROJECT_ASR_MODEL", "medium")
-DEFAULT_REFINE_ASR_MODEL_NAME = os.environ.get("FINAL_PROJECT_REFINE_ASR_MODEL", "large-v3")
+DEFAULT_REFINE_ASR_MODEL_NAME = os.environ.get("FINAL_PROJECT_REFINE_ASR_MODEL", "medium")
+DEFAULT_PRECISE_SUBTITLE_MAX_CLIPS = int(os.environ.get("FINAL_PROJECT_PRECISE_SUBTITLE_MAX_CLIPS", "12"))
 DEFAULT_ASR_BEAM_SIZE = int(os.environ.get("FINAL_PROJECT_ASR_BEAM_SIZE", "1"))
 DEFAULT_ASR_CHUNK_DURATION = float(os.environ.get("FINAL_PROJECT_ASR_CHUNK_DURATION", "1800"))
 DEFAULT_ASR_CHUNK_OVERLAP = float(os.environ.get("FINAL_PROJECT_ASR_CHUNK_OVERLAP", "1.0"))

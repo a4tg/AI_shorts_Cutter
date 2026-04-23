@@ -27,11 +27,12 @@ from typing import Callable, List, Optional
 from .core.frame_editor import EditorStandard, FrameEditor
 from .decorators.blur_overlay import BlurOverlay
 from .decorators.sound_overlay import SoundOverlay
-from .decorators.sticker_overlay import StickerOverlay
 from .generator import ShortsGenerator
 from .models import ProcessingRequest, SubtitleStyle
+from .runtime_logging import configure_runtime_logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+configure_runtime_logging("cli")
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,6 +173,21 @@ def _resolve_clip_counts(
     return positive_counts
 
 
+def _parse_sticker_paths(raw_value: str | None) -> List[str]:
+    if not raw_value:
+        return []
+    normalized = raw_value.replace("\n", ";").replace(",", ";")
+    paths: List[str] = []
+    seen: set[str] = set()
+    for item in normalized.split(";"):
+        path = item.strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        paths.append(path)
+    return paths
+
+
 def build_processing_requests(args: argparse.Namespace) -> List[ProcessingRequest]:
     if args.min_duration <= 0 or args.max_duration <= 0:
         raise ValueError("Clip durations must be greater than zero")
@@ -185,6 +201,7 @@ def build_processing_requests(args: argparse.Namespace) -> List[ProcessingReques
         fontsize=args.subtitle_fontsize,
         background_enabled=args.subtitle_background,
     )
+    sticker_paths = _parse_sticker_paths(args.sticker)
     requests: List[ProcessingRequest] = []
     for input_path, output_dir, clip_count in zip(input_paths, output_dirs, clip_counts):
         requests.append(
@@ -197,7 +214,8 @@ def build_processing_requests(args: argparse.Namespace) -> List[ProcessingReques
                 max_clip_duration=args.max_duration,
                 coords=tuple(args.coords) if args.coords else None,
                 blur_radius=args.blur_radius,
-                sticker_path=args.sticker,
+                sticker_path=sticker_paths[0] if sticker_paths else None,
+                sticker_paths=tuple(sticker_paths),
                 sticker_size=tuple(args.sticker_size) if args.sticker_size else None,
                 sticker_position=args.sticker_position,
                 sound_path=args.sound,
@@ -223,15 +241,6 @@ def build_generator(
     decorators: List = []
     if request.blur_radius > 0:
         decorators.append(BlurOverlay(radius=request.blur_radius))
-    if request.sticker_path:
-        decorators.append(
-            StickerOverlay(
-                sticker_path=request.sticker_path,
-                size=request.sticker_size,
-                position=request.sticker_position,
-                opacity=1.0,
-            )
-        )
     if request.sound_path:
         decorators.append(SoundOverlay(audio_path=request.sound_path))
     return ShortsGenerator(

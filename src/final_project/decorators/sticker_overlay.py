@@ -8,7 +8,10 @@ target clip it will be looped automatically.
 """
 
 from pathlib import Path
+from collections import OrderedDict
 import math
+import os
+import threading
 from typing import Optional, Tuple, Union
 import numpy as np
 
@@ -20,6 +23,11 @@ StickerPositionType = Union[Tuple[int, int], Tuple[str, str], Tuple[str, int], T
 
 
 class StickerOverlay(DecoratorInterface):
+    _STATIC_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp"}
+    _STATIC_IMAGE_CACHE: "OrderedDict[tuple[str, int, int], np.ndarray]" = OrderedDict()
+    _STATIC_IMAGE_CACHE_LOCK = threading.Lock()
+    _STATIC_IMAGE_CACHE_LIMIT = max(1, int(os.environ.get("FINAL_PROJECT_STICKER_IMAGE_CACHE_SIZE", "16")))
+
     def __init__(
         self,
         priority_index: int = 50,
@@ -84,8 +92,34 @@ class StickerOverlay(DecoratorInterface):
             return clip
         return clip.cropped(x1=x1, y1=y1, x2=x2, y2=y2)
 
-    @staticmethod
-    def _load_sticker(file_path: str) -> Optional[Union[VideoClip, ImageClip]]:
+    @classmethod
+    def _static_image_cache_key(cls, path: Path) -> tuple[str, int, int]:
+        stat = path.stat()
+        return str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size)
+
+    @classmethod
+    def _load_static_image_array(cls, path: Path) -> np.ndarray:
+        cache_key = cls._static_image_cache_key(path)
+        with cls._STATIC_IMAGE_CACHE_LOCK:
+            cached = cls._STATIC_IMAGE_CACHE.get(cache_key)
+            if cached is not None:
+                cls._STATIC_IMAGE_CACHE.move_to_end(cache_key)
+                return cached
+
+        from PIL import Image
+
+        with Image.open(path) as image:
+            loaded = np.array(image.convert("RGBA"))
+
+        with cls._STATIC_IMAGE_CACHE_LOCK:
+            cls._STATIC_IMAGE_CACHE[cache_key] = loaded
+            cls._STATIC_IMAGE_CACHE.move_to_end(cache_key)
+            while len(cls._STATIC_IMAGE_CACHE) > cls._STATIC_IMAGE_CACHE_LIMIT:
+                cls._STATIC_IMAGE_CACHE.popitem(last=False)
+        return loaded
+
+    @classmethod
+    def _load_sticker(cls, file_path: str) -> Optional[Union[VideoClip, ImageClip]]:
         if not file_path:
             return None
         path = Path(file_path)
@@ -95,8 +129,8 @@ class StickerOverlay(DecoratorInterface):
         try:
             if ext in [".gif", ".mp4", ".mov", ".avi"]:
                 clip = VideoFileClip(file_path, has_mask=ext != ".gif", audio=False)
-            elif ext in [".png", ".jpg", ".jpeg", ".bmp"]:
-                clip = ImageClip(file_path)
+            elif ext in cls._STATIC_IMAGE_EXTENSIONS:
+                clip = ImageClip(cls._load_static_image_array(path).copy())
             else:
                 raise ValueError(f"Unsupported sticker format: {ext}")
             return clip

@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .moviepy_compat import apply_moviepy_compatibility_fixes
+
 
 def _load_local_env() -> None:
     """Load project-local .env values once without overriding explicit env vars."""
@@ -29,6 +31,7 @@ def _load_local_env() -> None:
 
 
 _load_local_env()
+apply_moviepy_compatibility_fixes()
 
 __all__ = [
     "core",

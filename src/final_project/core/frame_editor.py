@@ -1,6 +1,7 @@
 """Frame editors used to crop and resize video segments."""
 
 from abc import ABC, abstractmethod
+import os
 from typing import Dict, List, Tuple, Union
 
 from moviepy import ColorClip, CompositeVideoClip, ImageClip, VideoClip  # type: ignore
@@ -34,10 +35,48 @@ class EditorStandard(EditorInterface):
         target_size: Tuple[int, int] = TARGET_SHORT_SIZE,
         foreground_scale: float = STANDARD_FOREGROUND_SCALE,
         blur_kernel: int = STANDARD_BACKGROUND_BLUR_KERNEL,
+        background_blur_scale: float | None = None,
     ) -> None:
         self.target_size = target_size
         self.foreground_scale = foreground_scale
         self.blur_kernel = blur_kernel if blur_kernel % 2 == 1 else blur_kernel + 1
+        self.background_blur_scale = self._resolve_background_blur_scale(background_blur_scale)
+
+    @staticmethod
+    def _resolve_background_blur_scale(configured_scale: float | None = None) -> float:
+        if configured_scale is None:
+            raw_value = os.environ.get("FINAL_PROJECT_BACKGROUND_BLUR_SCALE", "0.5")
+            try:
+                configured_scale = float(raw_value)
+            except ValueError:
+                configured_scale = 0.5
+        return max(0.1, min(1.0, float(configured_scale)))
+
+    @staticmethod
+    def _make_odd_kernel(kernel_size: int) -> int:
+        bounded = max(3, int(kernel_size))
+        return bounded if bounded % 2 == 1 else bounded + 1
+
+    def _blur_frame(self, frame, cv2):
+        if self.background_blur_scale >= 0.999:
+            return cv2.GaussianBlur(frame, (self.blur_kernel, self.blur_kernel), 0)
+        height, width = frame.shape[:2]
+        scaled_width = max(1, int(width * self.background_blur_scale))
+        scaled_height = max(1, int(height * self.background_blur_scale))
+        if scaled_width >= width and scaled_height >= height:
+            return cv2.GaussianBlur(frame, (self.blur_kernel, self.blur_kernel), 0)
+        scaled_kernel = self._make_odd_kernel(round(self.blur_kernel * self.background_blur_scale))
+        small_frame = cv2.resize(
+            frame,
+            (scaled_width, scaled_height),
+            interpolation=cv2.INTER_AREA,
+        )
+        blurred_frame = cv2.GaussianBlur(small_frame, (scaled_kernel, scaled_kernel), 0)
+        return cv2.resize(
+            blurred_frame,
+            (width, height),
+            interpolation=cv2.INTER_LINEAR,
+        )
 
     def _resize_to_fill(self, clip: VideoClip, target_size: Tuple[int, int]) -> VideoClip:
         target_width, target_height = target_size
@@ -76,7 +115,7 @@ class EditorStandard(EditorInterface):
             return clip
 
         def blur_frame(frame):
-            return cv2.GaussianBlur(frame, (self.blur_kernel, self.blur_kernel), 0)
+            return self._blur_frame(frame, cv2)
 
         return clip.image_transform(blur_frame)
 

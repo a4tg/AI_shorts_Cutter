@@ -1,4 +1,5 @@
 import sys
+import asyncio
 import types
 from pathlib import Path
 import numpy as np
@@ -46,6 +47,8 @@ class _StubClip:
         return self
 
     def write_videofile(self, *args, **kwargs):
+        self.write_videofile_args = args
+        self.write_videofile_kwargs = kwargs
         return None
 
 
@@ -87,16 +90,21 @@ sys.modules.setdefault("ffmpeg", ffmpeg_stub)
 
 from final_project.core.frame_editor import EditorStandard
 from final_project import generator as generator_module
-from final_project.generator import Candidate, ShortsGenerator
+from final_project.generator import BannerRenderJob, Candidate, ShortsGenerator
 from final_project.gpu import RuntimeDiagnostics, format_runtime_summary, torch_cuda_available
 from final_project.gui import (
+    QueueItem,
+    _format_runtime_duration,
+    _merge_banner_path_values,
     build_request_from_form_values,
     build_requests_from_form_values,
     build_requests_from_queue_items,
     filter_font_labels,
 )
 from final_project.main import build_processing_request, build_processing_requests, parse_args
-from final_project.models import SubtitleStyle
+from final_project.models import ProcessingRequest, SubtitleStyle
+from final_project.moviepy_compat import make_reader_close_safe, safe_close_video_clip
+from final_project.runtime_logging import configure_runtime_logging
 from final_project.decorators.sticker_overlay import StickerOverlay
 from final_project.decorators.subtitle_overlay import SubtitlesOverlay
 from final_project import segmentation
@@ -220,6 +228,28 @@ def test_build_processing_requests_apply_individual_clip_counts(monkeypatch):
     assert [item.clip_count for item in requests] == [3, 7]
 
 
+def test_cli_sticker_argument_accepts_multiple_banner_paths(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prog",
+            "--input",
+            "in.mp4",
+            "--output",
+            "out",
+            "--sticker",
+            "C:/banners/one.mov; C:/banners/two.mov",
+        ],
+    )
+    args = parse_args()
+
+    request = build_processing_request(args)
+
+    assert request.sticker_path == "C:/banners/one.mov"
+    assert request.sticker_paths == ("C:/banners/one.mov", "C:/banners/two.mov")
+
+
 def test_editor_standard_builds_blurred_background_and_scaled_foreground():
     clip = DummyClip((1920, 1080))
     editor = EditorStandard()
@@ -231,6 +261,63 @@ def test_editor_standard_builds_blurred_background_and_scaled_foreground():
     assert len(clip.resize_calls) >= 2
     assert clip.image_transform_calls == 1
     assert clip.crop_calls
+
+
+def test_editor_standard_fast_background_blur_downscales_before_blurring():
+    class FakeCv2:
+        INTER_AREA = 3
+        INTER_LINEAR = 1
+
+        def __init__(self):
+            self.resize_calls = []
+            self.blur_calls = []
+
+        def resize(self, frame, size, interpolation):
+            self.resize_calls.append((size, interpolation))
+            width, height = size
+            return np.zeros((height, width, frame.shape[2]), dtype=frame.dtype)
+
+        def GaussianBlur(self, frame, kernel, sigma):
+            self.blur_calls.append((frame.shape, kernel, sigma))
+            return frame
+
+    fake_cv2 = FakeCv2()
+    editor = EditorStandard(blur_kernel=81, background_blur_scale=0.5)
+    frame = np.zeros((1920, 1080, 3), dtype=np.uint8)
+
+    result = editor._blur_frame(frame, fake_cv2)
+
+    assert result.shape == frame.shape
+    assert fake_cv2.resize_calls == [((540, 960), fake_cv2.INTER_AREA), ((1080, 1920), fake_cv2.INTER_LINEAR)]
+    assert fake_cv2.blur_calls[0][1] == (41, 41)
+
+
+def test_editor_standard_background_blur_scale_one_uses_full_frame_blur():
+    class FakeCv2:
+        INTER_AREA = 3
+        INTER_LINEAR = 1
+
+        def __init__(self):
+            self.resize_calls = []
+            self.blur_calls = []
+
+        def resize(self, frame, size, interpolation):
+            self.resize_calls.append((size, interpolation))
+            return frame
+
+        def GaussianBlur(self, frame, kernel, sigma):
+            self.blur_calls.append((frame.shape, kernel, sigma))
+            return frame
+
+    fake_cv2 = FakeCv2()
+    editor = EditorStandard(blur_kernel=81, background_blur_scale=1.0)
+    frame = np.zeros((1920, 1080, 3), dtype=np.uint8)
+
+    result = editor._blur_frame(frame, fake_cv2)
+
+    assert result is frame
+    assert fake_cv2.resize_calls == []
+    assert fake_cv2.blur_calls == [((1920, 1080, 3), (81, 81), 0)]
 
 
 def test_gui_form_values_build_request():
@@ -256,6 +343,8 @@ def test_gui_form_values_build_request():
     assert request.max_clip_duration == 22
     assert request.mode == "beat"
     assert request.sticker_path == "sticker.gif"
+    assert request.sticker_paths == ("sticker.gif",)
+    assert request.sticker_clips_count is None
     assert request.sticker_position == "below_subtitles_center"
     assert request.sound_path == "music.mp3"
     assert request.subtitle_style.enabled is False
@@ -298,6 +387,75 @@ def test_gui_queue_items_build_requests_apply_individual_clip_counts():
     assert [item.input_path for item in requests] == ["C:/videos/alpha.mp4", "C:/videos/beta.mp4"]
     assert [item.clip_count for item in requests] == [4, 6]
     assert [Path(item.output_dir) for item in requests] == [Path("C:/output/alpha"), Path("C:/output/beta")]
+
+
+def test_gui_queue_items_apply_banner_only_to_checked_videos():
+    requests = build_requests_from_queue_items(
+        queue_items=[
+            QueueItem("C:/videos/alpha.mp4", 4, use_banner=True),
+            QueueItem("C:/videos/beta.mp4", 6, use_banner=False),
+        ],
+        output_dir="C:/output",
+        gif_path="banner.gif",
+    )
+
+    assert requests[0].sticker_path == "banner.gif"
+    assert requests[0].sticker_paths == ("banner.gif",)
+    assert requests[1].sticker_path is None
+    assert requests[1].sticker_paths == ()
+
+
+def test_gui_queue_items_apply_individual_banner_clip_counts():
+    requests = build_requests_from_queue_items(
+        queue_items=[
+            QueueItem("C:/videos/alpha.mp4", 4, use_banner=True, banner_clip_count=1),
+            QueueItem("C:/videos/beta.mp4", 6, use_banner=True, banner_clip_count=3),
+            QueueItem("C:/videos/gamma.mp4", 5, use_banner=False, banner_clip_count=2),
+        ],
+        output_dir="C:/output",
+        gif_path="banner.gif",
+    )
+
+    assert [item.sticker_clips_count for item in requests] == [1, 3, None]
+    assert [item.sticker_path for item in requests] == ["banner.gif", "banner.gif", None]
+
+
+def test_gui_form_values_build_request_with_multiple_banners_and_clip_limit():
+    request = build_request_from_form_values(
+        input_path="input.mp4",
+        output_dir="output",
+        clip_count="7",
+        gif_path="one.gif; two.gif",
+        banner_clip_count="3",
+    )
+
+    assert request.sticker_path == "one.gif"
+    assert request.sticker_paths == ("one.gif", "two.gif")
+    assert request.sticker_clips_count == 3
+
+
+def test_merge_banner_path_values_appends_without_duplicates():
+    merged = _merge_banner_path_values(
+        "C:/stickers/one.gif",
+        ["C:/stickers/two.gif", "C:/stickers/one.gif"],
+    )
+
+    assert merged == "C:/stickers/one.gif; C:/stickers/two.gif"
+
+
+def test_gui_form_values_reject_invalid_banner_clip_count():
+    try:
+        build_request_from_form_values(
+            input_path="input.mp4",
+            output_dir="output",
+            clip_count="3",
+            gif_path="one.gif",
+            banner_clip_count="abc",
+        )
+    except ValueError as exc:
+        assert str(exc) == "Banner clip count must be an integer"
+    else:
+        raise AssertionError("Expected ValueError for invalid banner clip count")
 
 
 def test_gui_form_values_reject_invalid_clip_count():
@@ -420,6 +578,35 @@ def test_transcribe_audio_uses_chunked_mode_for_long_audio(monkeypatch):
     assert segments[0]["text"] == "chunked"
 
 
+def test_get_speech_candidates_reuses_provided_pauses(monkeypatch):
+    async def fake_transcribe_audio(_audio_path):
+        return (
+            "privet kak dela",
+            [{"start": 0.0, "end": 5.0, "text": "privet kak dela"}],
+        )
+
+    def fail_if_called(_audio_path):
+        raise AssertionError("pause detection should be reused")
+
+    monkeypatch.setattr(generator_module, "transcribe_audio", fake_transcribe_audio)
+    monkeypatch.setattr(generator_module, "detect_speech_pauses", fail_if_called)
+
+    generator = ShortsGenerator(editor=EditorStandard())
+
+    candidates = asyncio.run(
+        generator._get_speech_candidates(
+            audio_path="audio.wav",
+            video_duration=10.0,
+            min_clip_duration=1.0,
+            max_clip_duration=5.0,
+            clip_count=1,
+            pauses=[],
+        )
+    )
+
+    assert candidates
+
+
 def test_get_faster_whisper_model_caches_instance(monkeypatch):
     created = []
 
@@ -497,6 +684,23 @@ def test_sticker_overlay_crop_white_margins_detects_content_bbox():
 
     assert result is clip
     assert clip.cropped_args == {"x1": 3, "y1": 2, "x2": 7, "y2": 5}
+
+
+def test_sticker_overlay_caches_static_image_arrays():
+    from PIL import Image
+
+    root = Path("test_runtime_logging_tmp") / "sticker_cache"
+    root.mkdir(parents=True, exist_ok=True)
+    sticker_path = root / "sticker.png"
+    Image.new("RGBA", (2, 2), (255, 0, 0, 255)).save(sticker_path)
+    with StickerOverlay._STATIC_IMAGE_CACHE_LOCK:
+        StickerOverlay._STATIC_IMAGE_CACHE.clear()
+
+    first = StickerOverlay._load_static_image_array(sticker_path)
+    second = StickerOverlay._load_static_image_array(sticker_path)
+
+    assert first is second
+    assert first.shape == (2, 2, 4)
 
 
 def test_subtitles_overlay_renders_with_float_style_values():
@@ -653,15 +857,28 @@ def test_build_export_settings_falls_back_to_x264(monkeypatch):
     assert ffmpeg_params == ["-crf", "17", "-pix_fmt", "yuv420p"]
 
 
-def test_resolve_parallel_export_plan_uses_safe_defaults(monkeypatch):
+def test_write_clip_uses_unique_moviepy_temp_audiofile(monkeypatch):
+    clip = _StubClip()
+    generator = ShortsGenerator(editor=EditorStandard())
+    monkeypatch.setattr(generator_module, "ffmpeg_nvenc_available", lambda: False)
+
+    generator._write_clip(clip, "C:/out/clip_0.mp4", threads=1)
+
+    temp_audiofile = clip.write_videofile_kwargs["temp_audiofile"]
+    assert temp_audiofile.endswith(".mp3")
+    assert "clip_0_audio_" in temp_audiofile
+    assert clip.write_videofile_kwargs["remove_temp"] is True
+
+
+def test_resolve_parallel_export_plan_uses_cpu_threads_by_default(monkeypatch):
     monkeypatch.delenv("FINAL_PROJECT_PARALLEL_EXPORTS", raising=False)
     monkeypatch.delenv("FINAL_PROJECT_EXPORT_THREADS", raising=False)
     monkeypatch.setattr(generator_module, "ffmpeg_nvenc_available", lambda: False)
 
     workers, threads = ShortsGenerator._resolve_parallel_export_plan(clip_count=5, cpu_count=8)
 
-    assert workers == 4
-    assert threads == 2
+    assert workers == 1
+    assert threads == 7
 
 
 def test_resolve_parallel_export_plan_honors_env_override(monkeypatch):
@@ -682,8 +899,222 @@ def test_resolve_parallel_export_plan_prefers_more_workers_with_nvenc(monkeypatc
 
     workers, threads = ShortsGenerator._resolve_parallel_export_plan(clip_count=5, cpu_count=8)
 
-    assert workers == 5
+    assert workers == 2
     assert threads == 1
+
+
+def test_build_banner_candidate_indices_selects_random_subset(monkeypatch):
+    monkeypatch.setattr(generator_module.random, "sample", lambda population, k: [0, 2])
+
+    indices = ShortsGenerator._build_banner_candidate_indices(sticker_clips_count=2, total_candidates=4)
+
+    assert indices == {0, 2}
+
+
+def test_reuse_base_renders_for_banners_reads_env(monkeypatch):
+    monkeypatch.setenv("FINAL_PROJECT_REUSE_BASE_FOR_BANNERS", "false")
+
+    assert ShortsGenerator._reuse_base_renders_for_banners() is False
+
+    monkeypatch.setenv("FINAL_PROJECT_REUSE_BASE_FOR_BANNERS", "true")
+
+    assert ShortsGenerator._reuse_base_renders_for_banners() is True
+
+
+def test_render_banner_jobs_parallel_keeps_multiple_banners(monkeypatch):
+    generator = ShortsGenerator(editor=EditorStandard())
+    request = ProcessingRequest(input_path="input.mp4", output_dir="output")
+    candidate = Candidate(0.0, 10.0, "hello")
+    jobs = [
+        BannerRenderJob(
+            candidate_index=0,
+            candidate=candidate,
+            source_path="base.mp4",
+            output_path="with_banner_a.mp4",
+            subtitles=[],
+            banner_path="banner_a.png",
+        ),
+        BannerRenderJob(
+            candidate_index=0,
+            candidate=candidate,
+            source_path="base.mp4",
+            output_path="with_banner_b.mp4",
+            subtitles=[],
+            banner_path="banner_b.png",
+        ),
+    ]
+    seen_banners = []
+
+    monkeypatch.setattr(generator, "_resolve_parallel_export_plan", lambda clip_count, cpu_count=None: (2, 1))
+
+    def fake_render_banner_job(request, job, total_jobs, export_threads, job_index, progress_tracker):
+        del request, total_jobs, export_threads, job_index, progress_tracker
+        seen_banners.append(job.banner_path)
+        return job.output_path
+
+    monkeypatch.setattr(generator, "_render_banner_job", fake_render_banner_job)
+
+    result = asyncio.run(generator._render_banner_jobs_parallel(request, jobs))
+
+    assert sorted(seen_banners) == ["banner_a.png", "banner_b.png"]
+    assert sorted(result) == ["with_banner_a.mp4", "with_banner_b.mp4"]
+
+
+def test_make_temp_audio_path_uses_unique_files_in_output_dir():
+    root = Path("test_runtime_logging_tmp") / "audio_temp"
+    root.mkdir(parents=True, exist_ok=True)
+    first = Path(ShortsGenerator._make_temp_audio_path(str(root)))
+    second = Path(ShortsGenerator._make_temp_audio_path(str(root)))
+
+    try:
+        assert first.parent == root.resolve()
+        assert second.parent == root.resolve()
+        assert first != second
+        assert first.exists()
+        assert second.exists()
+    finally:
+        first.unlink(missing_ok=True)
+        second.unlink(missing_ok=True)
+
+
+def test_resolve_clip_output_path_splits_banner_and_non_banner():
+    root = Path("test_runtime_logging_tmp") / "banner_output_split"
+    root.mkdir(parents=True, exist_ok=True)
+    request = ProcessingRequest(
+        input_path="in.mp4",
+        output_dir=str(root / "video_a"),
+    )
+
+    with_banner = ShortsGenerator._resolve_clip_output_path(
+        request,
+        candidate_index=1,
+        banner_folder="with_banner_banner_a",
+    )
+    without_banner = ShortsGenerator._resolve_clip_output_path(request, candidate_index=2, banner_folder=None)
+
+    assert Path(with_banner).parent.name == "with_banner_banner_a"
+    assert Path(without_banner).parent.name == "without_banner"
+    assert Path(with_banner).name == "clip_1.mp4"
+    assert Path(without_banner).name == "clip_2.mp4"
+
+
+def test_resolve_banner_folder_map_builds_unique_named_folders():
+    mapping = ShortsGenerator._resolve_banner_folder_map(
+        ["C:/stickers/brand.gif", "D:/more/brand.mp4", "C:/stickers/logo.gif"]
+    )
+
+    assert mapping["C:/stickers/brand.gif"] == "with_banner_brand"
+    assert mapping["D:/more/brand.mp4"] == "with_banner_brand_2"
+    assert mapping["C:/stickers/logo.gif"] == "with_banner_logo"
+
+
+def test_render_jobs_parallel_retries_sequentially_after_parallel_failure(monkeypatch):
+    editor = EditorStandard()
+    generator = ShortsGenerator(editor=editor)
+    request = types.SimpleNamespace()
+    jobs = [types.SimpleNamespace(), types.SimpleNamespace()]
+    calls = []
+
+    monkeypatch.setattr(
+        generator,
+        "_resolve_parallel_export_plan",
+        lambda clip_count, cpu_count=None: (2, 1),
+    )
+
+    async def fake_render_jobs_with_worker_count(request, jobs, worker_count, export_threads):
+        calls.append((worker_count, export_threads))
+        if worker_count == 2:
+            raise RuntimeError("parallel failure")
+        return ["clip_0.mp4", "clip_1.mp4"]
+
+    monkeypatch.setattr(generator, "_render_jobs_with_worker_count", fake_render_jobs_with_worker_count)
+
+    result = asyncio.run(generator._render_jobs_parallel(request, jobs))
+
+    assert result == ["clip_0.mp4", "clip_1.mp4"]
+    assert calls == [(2, 1), (1, 1)]
+
+
+def test_make_reader_close_safe_suppresses_invalid_handle_errors():
+    class DummyReader:
+        def __init__(self):
+            self.proc = types.SimpleNamespace(stdin=None, stdout=None, stderr=None)
+            self.last_read = "frame"
+
+    def failing_close(_self, delete_lastread=True):
+        del delete_lastread
+        exc = OSError("invalid handle")
+        exc.winerror = 6
+        raise exc
+
+    safe_close = make_reader_close_safe(failing_close)
+    reader = DummyReader()
+
+    safe_close(reader)
+
+    assert reader.proc is None
+    assert reader.last_read is None
+
+
+def test_safe_close_video_clip_suppresses_invalid_handle_errors():
+    class DummyResource:
+        def close(self):
+            exc = OSError("invalid handle")
+            exc.winerror = 6
+            raise exc
+
+    class DummyClip:
+        def __init__(self):
+            self.audio = DummyResource()
+            self.mask = DummyResource()
+            self.reader = DummyResource()
+
+        def close(self):
+            exc = OSError("invalid handle")
+            exc.winerror = 6
+            raise exc
+
+    safe_close_video_clip(DummyClip())
+
+
+def test_precise_subtitle_refinement_skips_after_configured_limit(monkeypatch):
+    editor = EditorStandard()
+    generator = ShortsGenerator(editor=editor, subtitle_style=SubtitleStyle(enabled=True))
+    request = types.SimpleNamespace(mode="speech", output_dir="C:/output", input_path="video.mp4")
+    candidate = Candidate(0.0, 10.0, "hello", subtitles=[{"start": 0.0, "end": 1.0, "text": "hello"}])
+
+    monkeypatch.setattr(generator_module, "ENABLE_PRECISE_SUBTITLE_REFINEMENT", True)
+    monkeypatch.setattr(generator_module, "DEFAULT_PRECISE_SUBTITLE_MAX_CLIPS", 2)
+
+    result = asyncio.run(generator._refine_candidate_subtitles(request, candidate, 2, 2))
+
+    assert result == candidate.subtitles
+
+
+def test_resolve_precise_subtitle_limit_disables_refinement_for_very_long_jobs(monkeypatch):
+    monkeypatch.setattr(generator_module, "DEFAULT_PRECISE_SUBTITLE_MAX_CLIPS", 12)
+    monkeypatch.setattr(generator_module, "VERY_LONG_VIDEO_SECONDS", 3 * 3600)
+    monkeypatch.setattr(generator_module, "LONG_VIDEO_SECONDS", 3600)
+
+    limit = ShortsGenerator._resolve_precise_subtitle_limit(clip_count=50, video_duration=100 * 3600)
+
+    assert limit == 0
+
+
+def test_format_runtime_duration_formats_elapsed_time():
+    assert _format_runtime_duration(59) == "00:59"
+    assert _format_runtime_duration(3661) == "1:01:01"
+
+
+def test_configure_runtime_logging_creates_log_file(monkeypatch):
+    temp_dir = Path("test_runtime_logging_tmp")
+    temp_dir.mkdir(exist_ok=True)
+    monkeypatch.chdir(temp_dir)
+
+    log_path = configure_runtime_logging("gui_test")
+
+    assert log_path.exists()
+    assert log_path.parent.name == "logs"
 
 
 def test_parallel_progress_tracker_reports_average_progress():

@@ -35,6 +35,8 @@ dist/
 temp_audio.wav
 *.tmp
 *.temp
+cookies.txt
+*TEMP_MPY_wvf_snd.mp3
 
 # IDE and editor files
 .idea/
